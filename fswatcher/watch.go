@@ -9,10 +9,10 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// Watch for changes to a directory on the filesystem and sends a notification to eventCh every time a file in the folder is changed.
+// Watch for changes to a directory on the filesystem and sends a notification to notifyCh every time a file in the folder is changed.
 // Although it's possible to watch for individual files, that's not recommended; watch for the file's parent folder instead.
 // Note that changes are batched for 0.5 seconds before notifications are sent
-func Watch(ctx context.Context, dir string, eventCh chan<- struct{}) error {
+func Watch(ctx context.Context, dir string, notifyCh chan<- struct{}) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
@@ -24,8 +24,10 @@ func Watch(ctx context.Context, dir string, eventCh chan<- struct{}) error {
 		return fmt.Errorf("watcher error: %w", err)
 	}
 
-	batchCh := make(chan struct{}, 1)
-	defer close(batchCh)
+	eventCh := make(chan struct{}, 1)
+	defer close(eventCh)
+
+	go startPublishEvents(ctx, eventCh, notifyCh)
 
 	for {
 		select {
@@ -34,17 +36,7 @@ func Watch(ctx context.Context, dir string, eventCh chan<- struct{}) error {
 			if event.Op&fsnotify.Create == fsnotify.Create ||
 				event.Op&fsnotify.Write == fsnotify.Write {
 				if strings.Contains(event.Name, dir) {
-					// Batch the change
-					select {
-					case batchCh <- struct{}{}:
-						go func() {
-							time.Sleep(500 * time.Millisecond)
-							<-batchCh
-							eventCh <- struct{}{}
-						}()
-					default:
-						// There's already a change in the batch - nop
-					}
+					eventCh <- struct{}{}
 				}
 			}
 
@@ -55,6 +47,27 @@ func Watch(ctx context.Context, dir string, eventCh chan<- struct{}) error {
 		// Stop on context canceled
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+}
+
+// startPublishEvents sends a notification to notifyCh every time an event is received on eventCh.
+// This should be run in a goroutine.
+func startPublishEvents(ctx context.Context, eventCh <-chan struct{}, notifyCh chan<- struct{}) {
+	shouldPublish := false
+	ticker := time.NewTicker(500 * time.Millisecond)
+
+	for {
+		select {
+		case <-eventCh:
+			shouldPublish = true
+		case <-ticker.C:
+			if shouldPublish {
+				notifyCh <- struct{}{}
+				shouldPublish = false
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
